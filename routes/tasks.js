@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const Task = require('../models/Task');
-const User = require('../models/User');
+const User = require('../models/user_temp');
 
 function parseJSONParam(value, fallback = {}) {
     if (value === undefined) return fallback;
