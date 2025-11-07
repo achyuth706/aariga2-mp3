@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
-const User = require('../models/user_temp');
+const User = require('../models/User');
 const Task = require('../models/Task');
 
 function parseJSONParam(value, fallback = {}) {
