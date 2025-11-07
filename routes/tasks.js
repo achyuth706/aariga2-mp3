@@ -73,7 +73,7 @@ router.post('/', async (req, res) => {
         }
 
         const description = typeof req.body.description === 'string' ? req.body.description : '';
-        const completed = typeof req.body.completed === 'boolean' ? req.body.completed : false;
+        const completed = (req.body.completed === true || req.body.completed === "true");
 
         let assignedUserId = typeof req.body.assignedUser === 'string' ? req.body.assignedUser.trim() : '';
         let assignedUserName = typeof req.body.assignedUserName === 'string' ? req.body.assignedUserName : 'unassigned';
@@ -142,7 +142,7 @@ router.put('/:id', async (req, res) => {
         task.name = name;
         task.deadline = deadline;
         task.description = typeof req.body.description === 'string' ? req.body.description : '';
-        task.completed = typeof req.body.completed === 'boolean' ? req.body.completed : false;
+        task.completed = (req.body.completed === true || req.body.completed === "true");
 
         let newAssignedUserId = typeof req.body.assignedUser === 'string'
             ? req.body.assignedUser.trim()
