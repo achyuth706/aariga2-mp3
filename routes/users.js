@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const User = require('../models/user');
+const mongoose = require('mongoose');
+const User = require('../models/User');
 const Task = require('../models/Task');
 
 function parseJSONParam(value, fallback = {}) {
@@ -15,26 +16,29 @@ function intOrUndefined(v) {
     return Number.isNaN(n) ? undefined : n;
 }
 
-// GET /api/users
+function isValidObjectId(id) {
+    return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
+}
+
 router.get('/', async (req, res) => {
     try {
         const where = parseJSONParam(req.query.where, {});
         const sort = parseJSONParam(req.query.sort, {});
         const select = parseJSONParam(req.query.select, {});
-        const skip = intOrUndefined(req.query.skip);
+        const skip = intOrUndefined(req.query.skip) || 0;
         const limit = intOrUndefined(req.query.limit);
         const count = req.query.count === 'true';
-
-        if (count) {
-            const total = await User.countDocuments(where);
-            return res.status(200).json({ message: 'OK', data: total });
-        }
 
         let q = User.find(where);
         if (Object.keys(sort).length) q = q.sort(sort);
         if (Object.keys(select).length) q = q.select(select);
-        if (skip !== undefined) q = q.skip(skip);
+        if (skip) q = q.skip(skip);
         if (limit !== undefined) q = q.limit(limit);
+
+        if (count) {
+            const pageDocs = await q.select({ _id: 1 }).lean().exec();
+            return res.status(200).json({ message: 'OK', data: pageDocs.length });
+        }
 
         const users = await q.exec();
         return res.status(200).json({ message: 'OK', data: users });
@@ -47,7 +51,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-// GET /api/users/:id
 router.get('/:id', async (req, res) => {
     try {
         const select = parseJSONParam(req.query.select, {});
@@ -59,11 +62,11 @@ router.get('/:id', async (req, res) => {
     }
 });
 
-// POST /api/users
 router.post('/', async (req, res) => {
     try {
         const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
-        const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
+        const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+
         if (!name || !email) {
             return res.status(400).json({ message: 'name and email are required', data: null });
         }
@@ -73,25 +76,46 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ message: 'A user with this email already exists', data: null });
         }
 
-        const pending = Array.isArray(req.body.pendingTasks) ? req.body.pendingTasks.map(String) : [];
-
-        // Ensure no completed tasks are added
-        if (pending.length > 0) {
-            const invalid = await Task.find({ _id: { $in: pending }, completed: true });
-            if (invalid.length > 0) {
-                return res.status(400).json({ message: 'Cannot add completed tasks to pendingTasks', data: null });
-            }
-        }
-
-        const user = new User({ name, email, pendingTasks: pending });
+        const user = new User({
+            name,
+            email,
+            pendingTasks: []
+        });
         await user.save();
 
-        // Two-way sync: assign user to all pendingTasks
-        if (pending.length > 0) {
-            await Task.updateMany(
-                { _id: { $in: pending } },
-                { $set: { assignedUser: user._id.toString(), assignedUserName: user.name } }
-            );
+        if (Array.isArray(req.body.pendingTasks) && req.body.pendingTasks.length) {
+            const incoming = [...new Set(req.body.pendingTasks.map(String))];
+
+            for (const tid of incoming) {
+                if (!isValidObjectId(tid)) {
+                    return res.status(400).json({ message: 'Bad Request: pendingTasks contains invalid task id', data: null });
+                }
+            }
+
+            const tasks = await Task.find({ _id: { $in: incoming } });
+            if (tasks.length !== incoming.length) {
+                return res.status(404).json({ message: 'One or more tasks in pendingTasks do not exist', data: null });
+            }
+
+            if (tasks.some(t => t.completed)) {
+                return res.status(400).json({ message: 'Cannot assign completed tasks to user', data: null });
+            }
+
+            for (const t of tasks) {
+                const oldOwnerId = t.assignedUser ? String(t.assignedUser) : '';
+                if (oldOwnerId && oldOwnerId !== user._id.toString()) {
+                    await User.updateOne(
+                        { _id: oldOwnerId },
+                        { $pull: { pendingTasks: t._id.toString() } }
+                    );
+                }
+                t.assignedUser = user._id.toString();
+                t.assignedUserName = user.name;
+                await t.save();
+            }
+
+            user.pendingTasks = incoming;
+            await user.save();
         }
 
         return res.status(201).json({ message: 'User created', data: user });
@@ -100,11 +124,11 @@ router.post('/', async (req, res) => {
     }
 });
 
-// PUT /api/users/:id
 router.put('/:id', async (req, res) => {
     try {
         const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
-        const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
+        const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+
         if (!name || !email) {
             return res.status(400).json({ message: 'name and email are required', data: null });
         }
@@ -117,33 +141,29 @@ router.put('/:id', async (req, res) => {
             return res.status(400).json({ message: 'A user with this email already exists', data: null });
         }
 
-        user.name = name;
-        user.email = email;
+        const incomingPending = Array.isArray(req.body.pendingTasks)
+            ? [...new Set(req.body.pendingTasks.map(String))]
+            : user.pendingTasks.map(String);
 
-        const incomingPending = Array.isArray(req.body.pendingTasks) ? req.body.pendingTasks.map(String) : user.pendingTasks.map(String);
-
-        // Prevent adding completed tasks
-        if (incomingPending.length > 0) {
-            const invalid = await Task.find({ _id: { $in: incomingPending }, completed: true });
-            if (invalid.length > 0) {
-                return res.status(400).json({ message: 'Cannot add completed tasks to pendingTasks', data: null });
+        for (const id of incomingPending) {
+            if (!isValidObjectId(id)) {
+                return res.status(400).json({ message: 'Bad Request: pendingTasks contains invalid task id', data: null });
             }
         }
 
-        const prevAssignedSet = new Set((user.pendingTasks || []).map(String));
-        const incomingSet = new Set(incomingPending);
-
-        const toAssign = [...incomingSet].filter(id => !prevAssignedSet.has(id));
-        const toUnassign = [...prevAssignedSet].filter(id => !incomingSet.has(id));
-
-        if (toAssign.length) {
-            const tasks = await Task.find({ _id: { $in: toAssign } });
-            await Promise.all(tasks.map(async (t) => {
-                t.assignedUser = user._id.toString();
-                t.assignedUserName = user.name;
-                await t.save();
-            }));
+        const tasks = await Task.find({ _id: { $in: incomingPending } });
+        if (tasks.length !== incomingPending.length) {
+            return res.status(404).json({ message: 'One or more tasks in pendingTasks do not exist', data: null });
         }
+
+        if (tasks.some(t => t.completed)) {
+            return res.status(400).json({ message: 'Cannot add completed tasks to pendingTasks', data: null });
+        }
+
+        const prevPending = new Set(user.pendingTasks.map(String));
+        const incomingSet = new Set(incomingPending);
+        const toAssign = [...incomingSet].filter(id => !prevPending.has(id));
+        const toUnassign = [...prevPending].filter(id => !incomingSet.has(id));
 
         if (toUnassign.length) {
             await Task.updateMany(
@@ -152,8 +172,34 @@ router.put('/:id', async (req, res) => {
             );
         }
 
+        if (toAssign.length) {
+            const toAssignDocs = await Task.find({ _id: { $in: toAssign } });
+            for (const t of toAssignDocs) {
+                if (t.completed) {
+                    return res.status(400).json({ message: 'Cannot assign completed tasks', data: null });
+                }
+                const oldOwnerId = t.assignedUser ? String(t.assignedUser) : '';
+                if (oldOwnerId && oldOwnerId !== user._id.toString()) {
+                    await User.updateOne(
+                        { _id: oldOwnerId },
+                        { $pull: { pendingTasks: t._id.toString() } }
+                    );
+                }
+                t.assignedUser = user._id.toString();
+                t.assignedUserName = name;
+                await t.save();
+            }
+        }
+
+        user.name = name;
+        user.email = email;
         user.pendingTasks = incomingPending;
         await user.save();
+
+        await Task.updateMany(
+            { assignedUser: user._id.toString() },
+            { $set: { assignedUserName: name } }
+        );
 
         return res.status(200).json({ message: 'User updated', data: user });
     } catch (err) {
@@ -165,7 +211,6 @@ router.put('/:id', async (req, res) => {
     }
 });
 
-// DELETE /api/users/:id
 router.delete('/:id', async (req, res) => {
     try {
         const user = await User.findByIdAndDelete(req.params.id);

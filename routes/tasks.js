@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
+const mongoose = require('mongoose');
 const Task = require('../models/Task');
-const User = require('../models/user');
+const User = require('../models/User');
 
 function parseJSONParam(value, fallback = {}) {
     if (value === undefined) return fallback;
@@ -15,33 +16,33 @@ function intOrUndefined(v) {
     return Number.isNaN(n) ? undefined : n;
 }
 
-async function loadUserOrNull(id) {
-    try { return await User.findById(id); } catch { return null; }
+function isValidObjectId(id) {
+    return typeof id === 'string' && mongoose.Types.ObjectId.isValid(id);
 }
 
-/* ======================= GET ALL TASKS ======================= */
 router.get('/', async (req, res) => {
     try {
         const where = parseJSONParam(req.query.where, {});
         const sort = parseJSONParam(req.query.sort, {});
         const select = parseJSONParam(req.query.select, {});
-        const skip = intOrUndefined(req.query.skip);
+        const skip = intOrUndefined(req.query.skip) || 0;
         const limit = intOrUndefined(req.query.limit);
         const count = req.query.count === 'true';
-
-        if (count) {
-            const total = await Task.countDocuments(where);
-            return res.status(200).json({ message: 'OK', data: total });
-        }
 
         let q = Task.find(where);
         if (Object.keys(sort).length) q = q.sort(sort);
         if (Object.keys(select).length) q = q.select(select);
-        if (skip !== undefined) q = q.skip(skip);
+        if (skip) q = q.skip(skip);
         if (limit !== undefined) q = q.limit(limit);
+
+        if (count) {
+            const pageDocs = await q.select({ _id: 1 }).lean().exec();
+            return res.status(200).json({ message: 'OK', data: pageDocs.length });
+        }
 
         const tasks = await q.exec();
         return res.status(200).json({ message: 'OK', data: tasks });
+
     } catch (err) {
         const msg = err.message === 'Invalid JSON in query parameter'
             ? 'Bad Request: one of where/sort/select contains invalid JSON'
@@ -51,7 +52,6 @@ router.get('/', async (req, res) => {
     }
 });
 
-/* ======================= GET ONE TASK ======================= */
 router.get('/:id', async (req, res) => {
     try {
         const select = parseJSONParam(req.query.select, {});
@@ -63,36 +63,41 @@ router.get('/:id', async (req, res) => {
     }
 });
 
-/* ======================= CREATE TASK (POST) ======================= */
 router.post('/', async (req, res) => {
     try {
         const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
         const deadline = req.body.deadline;
-        const completed = typeof req.body.completed === 'boolean' ? req.body.completed : false;
-        const assignedUserIdRaw = typeof req.body.assignedUser === 'string' ? req.body.assignedUser : '';
 
         if (!name || !deadline) {
             return res.status(400).json({ message: 'name and deadline are required', data: null });
         }
 
-        // ✅ Rule: Cannot assign a completed task to a user
-        if (completed && assignedUserIdRaw) {
-            return res.status(400).json({ message: 'Cannot assign a completed task to a user', data: null });
-        }
-
         const description = typeof req.body.description === 'string' ? req.body.description : '';
-        let assignedUserId = assignedUserIdRaw;
+        const completed = typeof req.body.completed === 'boolean' ? req.body.completed : false;
+
+        let assignedUserId = typeof req.body.assignedUser === 'string' ? req.body.assignedUser.trim() : '';
         let assignedUserName = typeof req.body.assignedUserName === 'string' ? req.body.assignedUserName : 'unassigned';
 
         let assignedUser = null;
+
         if (assignedUserId) {
-            assignedUser = await loadUserOrNull(assignedUserId);
-            if (!assignedUser) {
-                assignedUserId = '';
-                assignedUserName = 'unassigned';
-            } else {
-                assignedUserName = assignedUser.name;
+            if (!isValidObjectId(assignedUserId)) {
+                return res.status(400).json({ message: 'Bad Request: assignedUser is not a valid id', data: null });
             }
+
+            assignedUser = await User.findById(assignedUserId);
+            if (!assignedUser) {
+                return res.status(400).json({ message: 'Bad Request: assignedUser does not exist', data: null });
+            }
+
+            if (req.body.assignedUserName && req.body.assignedUserName !== assignedUser.name) {
+                return res.status(400).json({ message: 'Bad Request: assignedUserName does not match assignedUser', data: null });
+            }
+
+            assignedUserName = assignedUser.name;
+        } else {
+            assignedUserName = 'unassigned';
+            assignedUserId = '';
         }
 
         const task = new Task({
@@ -106,40 +111,31 @@ router.post('/', async (req, res) => {
 
         await task.save();
 
-        // ✅ Add to pending only if assigned + not completed
         if (assignedUser && !task.completed) {
-            assignedUser.pendingTasks = Array.from(
-                new Set([...(assignedUser.pendingTasks || []).map(String), task._id.toString()])
+            await User.updateOne(
+                { _id: assignedUser._id },
+                { $addToSet: { pendingTasks: task._id.toString() } }
             );
-            await assignedUser.save();
         }
 
         return res.status(201).json({ message: 'Task created', data: task });
+
     } catch {
         return res.status(500).json({ message: 'Server Error while creating task', data: null });
     }
 });
 
-/* ======================= UPDATE TASK (PUT) ======================= */
 router.put('/:id', async (req, res) => {
     try {
         const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
         const deadline = req.body.deadline;
+
         if (!name || !deadline) {
             return res.status(400).json({ message: 'name and deadline are required', data: null });
         }
 
         const task = await Task.findById(req.params.id);
         if (!task) return res.status(404).json({ message: 'Task not found', data: null });
-
-        // ✅ Rule: if task already completed → cannot reassign
-        const reqAssignedUserId = typeof req.body.assignedUser === 'string' ? req.body.assignedUser : '';
-        if (task.completed && reqAssignedUserId && reqAssignedUserId !== String(task.assignedUser)) {
-            return res.status(400).json({
-                message: 'Cannot reassign a task that is already completed',
-                data: null
-            });
-        }
 
         const prevAssignedUserId = task.assignedUser ? String(task.assignedUser) : '';
 
@@ -148,22 +144,38 @@ router.put('/:id', async (req, res) => {
         task.description = typeof req.body.description === 'string' ? req.body.description : '';
         task.completed = typeof req.body.completed === 'boolean' ? req.body.completed : false;
 
-        let newAssignedUserId = reqAssignedUserId || prevAssignedUserId;
+        let newAssignedUserId = typeof req.body.assignedUser === 'string'
+            ? req.body.assignedUser.trim()
+            : (task.assignedUser || '').toString();
+
         let newAssignedUser = null;
 
         if (newAssignedUserId) {
-            newAssignedUser = await loadUserOrNull(newAssignedUserId);
-            if (!newAssignedUser) {
-                newAssignedUserId = '';
-                task.assignedUserName = 'unassigned';
-            } else {
-                task.assignedUserName = newAssignedUser.name;
+            if (!isValidObjectId(newAssignedUserId)) {
+                return res.status(400).json({ message: 'Bad Request: assignedUser is not a valid id', data: null });
             }
+
+            newAssignedUser = await User.findById(newAssignedUserId);
+            if (!newAssignedUser) {
+                return res.status(400).json({ message: 'Bad Request: assignedUser does not exist', data: null });
+            }
+
+            if (req.body.assignedUserName && req.body.assignedUserName !== newAssignedUser.name) {
+                return res.status(400).json({ message: 'Bad Request: assignedUserName does not match assignedUser', data: null });
+            }
+
+            if (task.completed && newAssignedUserId !== prevAssignedUserId) {
+                return res.status(400).json({ message: 'Cannot reassign a completed task', data: null });
+            }
+
+            task.assignedUserName = newAssignedUser.name;
         } else {
             task.assignedUserName = 'unassigned';
+            newAssignedUserId = '';
         }
 
         task.assignedUser = newAssignedUserId;
+
         await task.save();
 
         if (prevAssignedUserId && prevAssignedUserId !== newAssignedUserId) {
@@ -188,6 +200,7 @@ router.put('/:id', async (req, res) => {
         }
 
         return res.status(200).json({ message: 'Task updated', data: task });
+
     } catch (err) {
         const msg = err.name === 'CastError'
             ? 'Bad Request: invalid task id'
@@ -197,7 +210,6 @@ router.put('/:id', async (req, res) => {
     }
 });
 
-/* ======================= DELETE TASK ======================= */
 router.delete('/:id', async (req, res) => {
     try {
         const task = await Task.findByIdAndDelete(req.params.id);
@@ -211,6 +223,7 @@ router.delete('/:id', async (req, res) => {
         }
 
         return res.status(204).json({ message: 'Task deleted', data: null });
+
     } catch {
         return res.status(400).json({ message: 'Bad Request: invalid task id', data: null });
     }
